@@ -1,0 +1,1 @@
+# DuckDuckGo web search wrapper
