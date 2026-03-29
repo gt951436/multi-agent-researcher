@@ -28,5 +28,3 @@ def get_llm(temperature: float=0.1) -> ChatGroq:
     
 MODEL_NAME = "LLaMA 3.3 70B (Groq)"
 MAX_RESEARCH_LOOPS = 2 # Critic can trigger re-research at most 2 times
-
-
