@@ -140,6 +140,7 @@ Present them as clear bullet points.""")
         # requests in rapid succession. A 2-second pause between
         # searches keeps us well within their tolerance.
         # This is standard practice for any scraping/search pipeline.
+        
         if i < len(sub_questions):  # no need to wait after the last one
             print(f"  [RESEARCHER] Waiting 2s before next search...")
             time.sleep(2)
