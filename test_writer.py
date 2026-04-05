@@ -22,7 +22,7 @@ ADDITIVE_KEYS = ["research_data", "sources", "status_log"]
 
 # --- Initial state ---
 initial_state: ResearchState = {
-    "query": "What is the current state of large language model research in 2025?",
+    "query": "What is the current state of large language model research up until April 2026?",
     "sub_questions": [],
     "research_data": [],
     "sources": [],

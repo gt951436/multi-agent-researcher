@@ -207,7 +207,7 @@ def _format_sources_block(sources: list[str]) -> str:
     markdown reference list.
 
     We deduplicate (sources list may have duplicates from multiple
-    research loops) and cap at 20 to keep the report readable.
+    research loops).
 
     Args:
         sources: List of URL strings from Researcher
@@ -220,16 +220,11 @@ def _format_sources_block(sources: list[str]) -> str:
 
     # Deduplicate while preserving order (dict preserves insertion order in Python 3.7+)
     unique_sources = list(dict.fromkeys(sources))
-
-    # Cap at 20 — more than this makes the references section unwieldy
-    display_sources = unique_sources[:20]
+    display_sources = unique_sources
 
     lines = []
     for i, url in enumerate(display_sources, 1):
         lines.append(f"{i}. {url}")
-
-    if len(unique_sources) > 20:
-        lines.append(f"\n_...and {len(unique_sources) - 20} additional sources._")
 
     return "\n".join(lines)
 
