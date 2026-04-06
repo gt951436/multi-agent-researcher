@@ -114,10 +114,14 @@ into a clear answer to the research question.""")
     print(f"  Summaries generated: {good_count}")
     print(f"  Gaps flagged:        {gap_count}")
 
+   # Confirm what we're returning
+    status_entry = (
+        f"Summarizer: Synthesized {good_count} summaries, "
+        f"flagged {gap_count} research gaps."
+    )
+    print(f"  Status log: {status_entry}")
+
     return {
-        "summaries": all_summaries,
-        "status_log": [
-            f"Summarizer: Synthesized {good_count} summaries, "
-            f"flagged {gap_count} research gaps."
-        ]
+        "summaries":   all_summaries,
+        "status_log":  [status_entry]   # must be a list — operator.add merges it
     }
