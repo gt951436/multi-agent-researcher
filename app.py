@@ -1,13 +1,9 @@
-# streamlit UI
-
+# app.py
 import streamlit as st
 from datetime import datetime
 from graph.workflow import build_graph
 from graph.state import ResearchState
 
-# ─────────────────────────────────────────────
-# Page configuration
-# ─────────────────────────────────────────────
 st.set_page_config(
     page_title="Multi-Agent Research Assistant",
     page_icon="🔬",
@@ -16,7 +12,22 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────────
-# Sidebar — About & Settings
+# Session state initialization
+# Streamlit re-runs app.py on every interaction.
+# We use session_state to persist data across re-runs
+# and prevent duplicate graph executions.
+# ─────────────────────────────────────────────
+if "is_running"    not in st.session_state:
+    st.session_state.is_running    = False
+if "final_state"   not in st.session_state:
+    st.session_state.final_state   = None
+if "last_query"    not in st.session_state:
+    st.session_state.last_query    = ""
+if "prefill_query" not in st.session_state:
+    st.session_state.prefill_query = ""
+
+# ─────────────────────────────────────────────
+# Sidebar
 # ─────────────────────────────────────────────
 with st.sidebar:
     st.title("🔬 Research Assistant")
@@ -24,35 +35,48 @@ with st.sidebar:
 
     st.markdown("### How it works")
     st.markdown("""
-This system uses **5 AI agents** working in a coordinated pipeline:
+5 specialized agents collaborate in a self-correcting pipeline:
 
-1. 🗂️ **Planner** — Breaks your query into sub-questions
-2. 🔍 **Researcher** — Searches the web for each sub-question
+1. 🗂️ **Planner** — Decomposes query into sub-questions
+2. 🔍 **Researcher** — Live web search per sub-question
 3. 📝 **Summarizer** — Synthesizes raw findings
-4. ✅ **Critic** — Reviews quality, may trigger re-research
-5. ✍️ **Writer** — Compiles the final report
+4. ✅ **Critic** — Strict quality review (may loop back)
+5. ✍️ **Writer** — Compiles final structured report
     """)
 
     st.markdown("---")
-    st.markdown("### Tech Stack")
+    st.markdown("### Critic rubric")
     st.markdown("""
-- **LLM:** LLaMA 3.3 70B via Groq (free)
-- **Orchestration:** LangGraph
-- **Search:** DuckDuckGo (free, no key)
-- **UI:** Streamlit
+The Critic evaluates each summary on:
+- **Specificity** — concrete facts, not vague claims
+- **Completeness** — sub-question fully answered
+- **Recency** — current information
+- **Depth** — meaningful analysis
+
+Fails → triggers re-research loop (max 2×)
     """)
+
+    st.markdown("---")
+    st.markdown("### Tech stack")
+    st.code(
+        "LLM:    LLaMA 3.3 70B (Groq)\n"
+        "Graph:  LangGraph\n"
+        "Search: DuckDuckGo\n"
+        "UI:     Streamlit",
+        language="text"
+    )
 
     st.markdown("---")
     st.markdown("### Example queries")
-    example_queries = [
+    examples = [
         "What is the current state of quantum computing?",
-        "How does CRISPR gene editing work and what are its applications?",
-        "What are the latest developments in renewable energy storage?",
-        "How are autonomous vehicles being tested and regulated in 2025?",
+        "How does mRNA vaccine technology work?",
+        "What are the latest developments in fusion energy?",
+        "How are autonomous vehicles regulated globally in 2025?",
     ]
-    for q in example_queries:
-        if st.button(q, use_container_width=True, key=q):
-            st.session_state["prefill_query"] = q
+    for q in examples:
+        if st.button(q, use_container_width=True, key=f"ex_{q}"):
+            st.session_state.prefill_query = q
             st.rerun()
 
 # ─────────────────────────────────────────────
@@ -60,77 +84,81 @@ This system uses **5 AI agents** working in a coordinated pipeline:
 # ─────────────────────────────────────────────
 st.title("🔬 Multi-Agent Research Assistant")
 st.markdown(
-    "Enter any research topic. Five specialized AI agents will "
-    "autonomously research, evaluate, and compile a structured report."
+    "Type any research topic. Five AI agents will autonomously "
+    "research, critique, and compile a structured report with live sources."
 )
 
 # ─────────────────────────────────────────────
 # Query input
 # ─────────────────────────────────────────────
-prefill = st.session_state.get("prefill_query", "")
-
 query = st.text_input(
     label="Research query",
-    placeholder="e.g. What is the current state of large language model research?",
-    value=prefill,
-    key="query_input"
+    placeholder="e.g. What is the current state of nuclear fusion research?",
+    value=st.session_state.prefill_query,
+    key="query_input",
+    disabled=st.session_state.is_running
 )
 
-col1, col2 = st.columns([1, 5])
+# Clear prefill after it's been used
+if st.session_state.prefill_query and query == st.session_state.prefill_query:
+    st.session_state.prefill_query = ""
+
+col1, col2, col3 = st.columns([1, 1, 4])
 with col1:
     run_button = st.button(
-        "🚀 Start Research",
+        "🚀 Research",
         type="primary",
         use_container_width=True,
-        disabled=not query.strip()
+        disabled=st.session_state.is_running or not query.strip()
+    )
+with col2:
+    clear_button = st.button(
+        "🗑️ Clear",
+        use_container_width=True,
+        disabled=st.session_state.is_running
     )
 
-# ─────────────────────────────────────────────
-# Main research execution
-# ─────────────────────────────────────────────
-if run_button and query.strip():
+if clear_button:
+    st.session_state.final_state = None
+    st.session_state.last_query  = ""
+    st.rerun()
 
-    # Clear any prefill after use
-    if "prefill_query" in st.session_state:
-        del st.session_state["prefill_query"]
+# ─────────────────────────────────────────────
+# Research execution
+# Only runs when button clicked AND not already running
+# session_state.is_running prevents Streamlit re-runs
+# from triggering the graph a second time
+# ─────────────────────────────────────────────
+if run_button and query.strip() and not st.session_state.is_running:
+
+    st.session_state.is_running  = True
+    st.session_state.final_state = None
+    st.session_state.last_query  = query.strip()
 
     st.markdown("---")
-
-    # --- Layout: two columns ---
-    # Left: live agent activity log
-    # Right: final report (appears when done)
     left_col, right_col = st.columns([1, 2])
 
     with left_col:
         st.markdown("### 🤖 Agent Activity")
-        activity_container = st.container()
 
     with right_col:
         st.markdown("### 📄 Research Report")
-        report_placeholder = st.empty()
-        report_placeholder.info(
-            "⏳ Report will appear here when all agents have finished..."
-        )
+        report_ph = st.empty()
+        report_ph.info("⏳ Report will appear here when complete...")
 
-    # --- Agent status tracker ---
-    # Maps agent names to display emoji + label
     agent_display = {
-        "planner":    ("🗂️", "Planner",    "Breaking query into sub-questions..."),
+        "planner":    ("🗂️", "Planner",    "Decomposing query..."),
         "researcher": ("🔍", "Researcher", "Searching the web..."),
         "summarizer": ("📝", "Summarizer", "Synthesizing findings..."),
-        "critic":     ("✅", "Critic",     "Reviewing research quality..."),
-        "writer":     ("✍️", "Writer",     "Compiling final report..."),
+        "critic":     ("✅", "Critic",     "Evaluating quality..."),
+        "writer":     ("✍️", "Writer",     "Writing report..."),
     }
 
-    # Track which agents have completed (for display)
     completed_agents = []
-    loop_count       = 0
     start_time       = datetime.now()
 
-    # --- Build the graph ---
     graph = build_graph()
 
-    # Build initial state
     initial_state: ResearchState = {
         "query":               query.strip(),
         "sub_questions":       [],
@@ -144,116 +172,131 @@ if run_button and query.strip():
         "status_log":          []
     }
 
-    # --- Stream the graph ---
-    # graph.stream() yields a dict after EACH node completes.
-    # The dict key is the node name, value is that node's state update.
-    # This lets us update the UI in real time.
-    final_state = initial_state.copy()
+    accumulated_state = {k: v for k, v in initial_state.items()}
 
-    with activity_container:
-        status_box = st.empty()
+    with left_col:
+        activity_box = st.empty()
 
     try:
-        for step_output in graph.stream(initial_state, {"recursion_limit": 25}):
-            # step_output = {"node_name": {state_updates_dict}}
-            node_name   = list(step_output.keys())[0]
-            node_update = step_output[node_name]
+        for step in graph.stream(initial_state, {"recursion_limit": 25}):
+            node_name   = list(step.keys())[0]
+            node_update = step[node_name]
 
-            # Merge into final_state to track accumulated state
-            for key, value in node_update.items():
+            # Merge update into accumulated state
+            for key, val in node_update.items():
                 if key in ["research_data", "sources", "status_log"] \
-                        and isinstance(value, list):
-                    existing = final_state.get(key, [])
-                    final_state[key] = existing + value
+                        and isinstance(val, list):
+                    accumulated_state[key] = accumulated_state.get(key, []) + val
                 else:
-                    final_state[key] = value
+                    accumulated_state[key] = val
 
-            # Track loop count
-            if node_name == "researcher":
-                loop_count = final_state.get("research_loops", 0)
-
-            # Record completion
             completed_agents.append(node_name)
 
-            # --- Rebuild activity log display ---
-            activity_lines = []
+            # --- Rebuild activity log ---
+            lines = []
+            seen  = set()
 
-            # Show completed agents
-            seen = set()
             for agent in completed_agents:
                 if agent in seen:
                     continue
                 seen.add(agent)
 
                 emoji, label, _ = agent_display.get(
-                    agent, ("⚙️", agent.title(), "Working...")
+                    agent, ("⚙️", agent.title(), "")
                 )
+                run_count  = completed_agents.count(agent)
+                loop_badge = f" `×{run_count}`" if run_count > 1 else ""
 
-                # Count how many times this agent ran (for loop display)
-                run_count = completed_agents.count(agent)
-                loop_note = f" _(×{run_count})_" if run_count > 1 else ""
-
-                # Pull the last status log entry for this agent
-                all_logs   = final_state.get("status_log", [])
+                # Get last status log entry for this agent
+                all_logs   = accumulated_state.get("status_log", [])
                 agent_logs = [l for l in all_logs
                               if label.lower() in l.lower()]
-                detail     = agent_logs[-1] if agent_logs else ""
+                detail     = f"_{agent_logs[-1]}_" if agent_logs else ""
 
-                activity_lines.append(
-                    f"✅ **{emoji} {label}**{loop_note}  \n"
-                    f"_{detail}_"
-                )
+                lines.append(f"✅ **{emoji} {label}**{loop_badge}  \n{detail}")
 
-            # Show currently running agent (next one)
-            next_agents = {
+            # Show what's running next
+            next_map = {
                 "planner":    "researcher",
                 "researcher": "summarizer",
                 "summarizer": "critic",
-                "critic":     "researcher" if final_state.get("needs_more_research") else "writer",
-                "writer":     None
+                "critic": (
+                    "researcher"
+                    if accumulated_state.get("needs_more_research")
+                    else "writer"
+                ),
+                "writer": None
             }
-            current_next = next_agents.get(node_name)
-            if current_next and current_next in agent_display:
-                e, l, msg = agent_display[current_next]
-                activity_lines.append(f"⏳ **{e} {l}**  \n_{msg}_")
+            nxt = next_map.get(node_name)
+            if nxt and nxt in agent_display:
+                e, l, msg = agent_display[nxt]
+                lines.append(f"\n⏳ **{e} {l}**  \n_{msg}_")
 
-            # Elapsed time
+            # Critic verdict badge
+            verdict = accumulated_state.get("needs_more_research", False)
+            loops   = accumulated_state.get("research_loops", 0)
+            if "critic" in completed_agents:
+                badge = "🔴 Needs more research" if verdict else "🟢 Approved"
+                lines.append(f"\n**Critic verdict:** {badge}  \n"
+                             f"**Loops:** {loops}/{2}")
+
             elapsed = (datetime.now() - start_time).seconds
-            activity_lines.append(f"\n⏱️ _Elapsed: {elapsed}s_")
+            lines.append(f"\n⏱️ _Elapsed: {elapsed}s_")
 
-            # Update the activity display
-            status_box.markdown("\n\n".join(activity_lines))
+            activity_box.markdown("\n\n".join(lines))
 
-            # --- Show report when Writer completes ---
+            # Show report when Writer is done
             if node_name == "writer":
-                report = final_state.get("final_report", "")
+                report = accumulated_state.get("final_report", "")
                 if report:
-                    report_placeholder.empty()
+                    report_ph.empty()
                     with right_col:
-                        # Download button
+                        dl_name = (
+                            f"report_{datetime.now().strftime('%Y%m%d_%H%M')}.md"
+                        )
                         st.download_button(
-                            label="⬇️ Download Report (.md)",
+                            "⬇️ Download Report (.md)",
                             data=report,
-                            file_name=f"research_report_{datetime.now().strftime('%Y%m%d_%H%M')}.md",
+                            file_name=dl_name,
                             mime="text/markdown",
                             use_container_width=True
                         )
-                        # Render the markdown report
                         st.markdown(report)
 
-    except Exception as e:
-        st.error(f"An error occurred during research: {e}")
-        st.exception(e)
+        # Store result
+        st.session_state.final_state = accumulated_state
 
-    # --- Final summary bar ---
+    except Exception as e:
+        st.error(f"Pipeline error: {e}")
+        st.exception(e)
+    finally:
+        # Always release the running lock — even if an error occurred
+        st.session_state.is_running = False
+
+    # --- Metrics bar ---
     elapsed_total = (datetime.now() - start_time).seconds
-    sources_count = len(set(final_state.get("sources", [])))
-    loops_ran     = final_state.get("research_loops", 0)
+    sources       = len(set(accumulated_state.get("sources", [])))
+    loops         = accumulated_state.get("research_loops", 0)
+    report_len    = len(accumulated_state.get("final_report", ""))
+    confidence    = (
+        "🟢 High" if "High" in accumulated_state.get("final_report", "")
+        else "🟡 Medium" if "Medium" in accumulated_state.get("final_report", "")
+        else "🔴 Low"
+    )
 
     st.markdown("---")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total time",       f"{elapsed_total}s")
-    m2.metric("Sources consulted", sources_count)
-    m3.metric("Research loops",    loops_ran)
-    m4.metric("Report length",
-              f"{len(final_state.get('final_report', ''))} chars")
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Time",        f"{elapsed_total}s")
+    m2.metric("Sources",     sources)
+    m3.metric("Loops",       loops)
+    m4.metric("Report",      f"{report_len} chars")
+    m5.metric("Confidence",  confidence)
+
+# Show previous result if no new run triggered
+elif st.session_state.final_state and not st.session_state.is_running:
+    st.markdown("---")
+    st.info(
+        f"Showing report for: **{st.session_state.last_query}**  \n"
+        f"Run a new query above to generate a fresh report."
+    )
+    st.markdown(st.session_state.final_state.get("final_report", ""))
