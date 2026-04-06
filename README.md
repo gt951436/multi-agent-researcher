@@ -133,16 +133,15 @@ Dotted edges = conditional routing driven by the Critic's verdict.
 
 ## Tech Stack
 
-| Component | Technology | Cost |
-|---|---|---|
-| LLM backbone | LLaMA 3.3 70B via [Groq API](https://console.groq.com) | **Free** (14,400 req/day) |
-| Agent orchestration | [LangGraph](https://langchain-ai.github.io/langgraph/) | Free / Open-source |
-| Agent framework | [LangChain](https://python.langchain.com) | Free / Open-source |
-| Web search | [ddgs](https://github.com/deedy5/ddgs) (DuckDuckGo) | **Free**, no API key |
-| UI | [Streamlit](https://streamlit.io) | Free |
-| Language | Python 3.11+ | Free |
+| Component | Technology |
+|---|-
+| LLM backbone | LLaMA 3.3 70B via [Groq API](https://console.groq.com)  (14,400 req/day free) 
+| Agent orchestration | [LangGraph](https://langchain-ai.github.io/langgraph/) 
+| Agent framework | [LangChain](https://python.langchain.com) 
+| Web search | [ddgs](https://github.com/deedy5/ddgs) (DuckDuckGo) 
+| UI | [Streamlit](https://streamlit.io)
+| Language | Python 3.11+ 
 
-**Total running cost: $0.00**
 
 ---
 
