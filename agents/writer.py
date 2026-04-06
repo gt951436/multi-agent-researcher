@@ -235,34 +235,39 @@ def _determine_confidence(
     summaries:      list[dict]
 ) -> str:
     """
-    Produces a human-readable confidence rating for the report
-    based on three signals:
+    Calculates an honest confidence rating using four signals:
 
-    1. research_loops: More loops = more targeted research = higher confidence
-    2. critique content: Did the Critic approve cleanly or reluctantly?
-    3. gap count: How many summaries were flagged as research gaps?
+    1. How many summaries were flagged as gaps by the Summarizer
+    2. Whether the Critic approved or found issues
+    3. How many research loops were needed before approval
+    4. Whether the Critic found any FAIL scores in individual summaries
 
-    Returns one of: "High", "Medium", "Low"
-
-    This rating appears in the Research Notes section of the report,
-    giving the reader an honest signal about research depth.
+    Scale:
+        High   → 0 gaps + clean APPROVED + 0 loops + all summaries PASS
+        Medium → approved but needed loops OR minor issues found
+        Low    → gaps present OR max loops hit without clean approval
     """
+    upper      = critique.upper()
     gap_count  = sum(1 for s in summaries if s.get("has_gap", False))
-    upper_crit = critique.upper()
+    approved   = "APPROVED" in upper
+    fail_count = upper.count(": FAIL")  # from SUMMARY SCORES section
 
-    # Low confidence signals
-    if gap_count >= 3:
+    # --- Low confidence conditions ---
+    if gap_count >= 2:
         return "Low"
-    if "NEEDS_MORE_RESEARCH" in upper_crit and research_loops == 0:
+    if not approved:
+        # Max loops hit without clean approval
+        return "Low"
+    if fail_count >= 3:
         return "Low"
 
-    # High confidence signals
-    if research_loops >= 1 and "APPROVED" in upper_crit and gap_count == 0:
-        return "High"
-    if gap_count == 0 and "APPROVED" in upper_crit:
+    # --- High confidence conditions ---
+    # Must satisfy ALL of: approved + no loops + no gaps + no fails
+    if approved and research_loops == 0 and gap_count == 0 and fail_count == 0:
         return "High"
 
-    # Everything else is Medium
+    # --- Medium: everything else ---
+    # Approved but needed loops, or approved with minor issues
     return "Medium"
 
 
