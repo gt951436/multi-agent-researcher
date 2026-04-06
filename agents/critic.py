@@ -58,12 +58,12 @@ def critic_agent(state: ResearchState) -> dict:
     # After MAX_RESEARCH_LOOPS attempts, we proceed to Writer with
     # whatever we have, noting the limitation in the critique.
     if research_loops >= MAX_RESEARCH_LOOPS:
-        print(f"[CRITIC] Max research loops ({MAX_RESEARCH_LOOPS}) reached.")
+        print(f"[CRITIC] Max research loops ({MAX_RESEARCH_LOOPS}) reached")
         print("[CRITIC] Proceeding to Writer despite any remaining gaps.")
         return {
-            "critique":            f"Maximum research loops ({MAX_RESEARCH_LOOPS}) reached. "
+            "critique":  (         f"Maximum research loops ({MAX_RESEARCH_LOOPS}) reached. "
                                    f"Proceeding to final report with available research. "
-                                   f"Some gaps may remain.",
+                                   f"Some gaps may remain."),
             "needs_more_research": False,   # force forward regardless
             "research_loops":      research_loops,
             "status_log": [
@@ -81,34 +81,63 @@ def critic_agent(state: ResearchState) -> dict:
     # The Critic's role is evaluator, not improver.
     # It identifies problems and articulates them precisely —
     # it does NOT rewrite or fix the summaries itself.
-    system_prompt = SystemMessage(content="""You are a rigorous research quality reviewer.
+    system_prompt = SystemMessage(content="""You are a demamding, rigorous, skeptical research quality reviewer and editor at a high-standard publication. Your job is to reject mediocre research.
 
 Your job is to evaluate a set of research summaries and determine if they 
 provide sufficient, accurate, and complete coverage of the original research query.
 
-Evaluate each summary for:
-1. COMPLETENESS — Does it fully answer its sub-question? 
-   Flag if it says things like "details not available" or is vague.
-2. SPECIFICITY — Does it contain concrete facts, names, dates, numbers?
-   Flag if it is generic and could apply to any topic.
-3. CONSISTENCY — Do any summaries contradict each other?
-   Flag specific contradictions if found.
+Evaluate each summary against this strict rubric:
 
-Your response MUST follow this exact format:
+CRITERION 1 — SPECIFICITY (most important)
+FAIL if the summary:
+  • Uses vague phrases like "various methods", "several approaches", "many researchers"
+    without naming them specifically
+  • Makes claims without concrete supporting evidence (numbers, names, dates, studies)
+  • Could apply to almost any topic in the field (generic filler)
+
+CRITERION 2 — COMPLETENESS  
+FAIL if the summary:
+  • Does not actually answer its specific sub-question
+  • Says things like "details not available", "not fully specified", "may vary"
+  • Covers only part of what the sub-question asks
+
+CRITERION 3 — RECENCY
+FAIL if the summary:
+  • Cites only general background knowledge with no recent developments
+  • Refers primarily to research older than 2 years without noting this
+  • Misses obviously recent and important developments in a fast-moving topic
+
+CRITERION 4 — DEPTH
+FAIL if the summary:
+  • Only provides surface-level definitions (what something IS, not how it WORKS)
+  • Lacks any analytical insight or meaningful comparison
+  • Is shorter than 3 substantial sentences
+
+SCORING:
+- If 2 or more summaries FAIL any criterion → NEEDS_MORE_RESEARCH
+- If 1 summary has a MAJOR failure (Criterion 1 or 2) → NEEDS_MORE_RESEARCH  
+- If all summaries pass all criteria → APPROVED
+- If 1 summary has only a minor issue → APPROVED with note
+
+You MUST respond in exactly this format:
 
 VERDICT: APPROVED or NEEDS_MORE_RESEARCH
 
+SUMMARY SCORES:
+- Summary 1: PASS/FAIL — [one sentence reason]
+- Summary 2: PASS/FAIL — [one sentence reason]
+- Summary 3: PASS/FAIL — [one sentence reason]
+- Summary 4: PASS/FAIL — [one sentence reason]
+- Summary 5: PASS/FAIL — [one sentence reason]
+
 ISSUES FOUND:
-- (list each issue with the summary number it refers to, or "None" if approved)
+- [list specific issues, or "None" if all pass]
 
 SPECIFIC GAPS TO ADDRESS:
-- (list specific topics or questions that need better research, or "None" if approved)
+- [list what the Researcher should search for next, or "None" if approved]
 
 OVERALL ASSESSMENT:
-(2-3 sentences explaining your overall judgment)
-
-Be strict but fair. Only approve if the summaries genuinely cover the topic well.
-If even one summary has a significant gap, output NEEDS_MORE_RESEARCH.
+[2-3 sentences. Be blunt. Name specific weaknesses.]
 """)
 
     human_prompt = HumanMessage(content=f"""Original research query: {original_query}
@@ -117,7 +146,7 @@ Research summaries to evaluate:
 
 {formatted_summaries}
 
-Evaluate these summaries and provide your verdict.""")
+Apply the strict rubric. Be a tough editor. Find the weaknesses.""")
 
     # temperature=0.1 — Critic must be consistent and deterministic
     # We don't want random variation in quality assessments
@@ -131,24 +160,27 @@ Evaluate these summaries and provide your verdict.""")
     # We look for "VERDICT: APPROVED" or "VERDICT: NEEDS_MORE_RESEARCH"
     # in the LLM's response to determine the routing decision.
     needs_more_research = _parse_verdict(critique)
-
+    summary_scores = _extract_summary_scores(critique)
+    
     if needs_more_research:
-        print(f"[CRITIC] VERDICT: NEEDS MORE RESEARCH")
+        fail_count = sum(1 for s in summary_scores if s == "FAIL")
+        print(f"[CRITIC] VERDICT: NEEDS MORE RESEARCH ({fail_count} summaries failed)")
         print(f"[CRITIC] Will trigger research loop #{research_loops + 1}")
     else:
-        print(f"[CRITIC] VERDICT: APPROVED — proceeding to Writer")
+        fail_count = sum(1 for s in summary_scores if s == "FAIL")
+        print(f"[CRITIC] VERDICT: APPROVED "
+              f"({'all passed' if fail_count == 0 else f'{fail_count} minor issue(s)'})")
 
-    # --- Increment loop counter ---
-    # We increment here so the Researcher knows which loop it's on
-    # if it gets called again.
     new_loop_count = research_loops + 1 if needs_more_research else research_loops
 
     return {
         "critique":            critique,
         "needs_more_research": needs_more_research,
         "research_loops":      new_loop_count,
+        "summary_scores":      summary_scores,
         "status_log": [
             f"Critic: {'NEEDS_MORE_RESEARCH' if needs_more_research else 'APPROVED'} "
+            f"— {sum(1 for s in summary_scores if s == 'FAIL')}/5 summaries failed "
             f"(loop {research_loops}/{MAX_RESEARCH_LOOPS})"
         ]
     }
@@ -184,8 +216,8 @@ def _format_summaries_for_critique(summaries: list[dict]) -> str:
 
         formatted.append(
             f"SUMMARY {i}{gap_note}:\n"
-            f"Question: {question}\n"
-            f"Summary: {summary}"
+            f"Sub-Question: {question}\n"
+            f"Content Summary: {summary}"
         )
 
     return "\n\n".join(formatted)
@@ -224,3 +256,23 @@ def _parse_verdict(critique_text: str) -> bool:
         # Better to write an imperfect report than to loop infinitely
         print("[CRITIC] Warning: Ambiguous verdict — defaulting to APPROVED")
         return False
+    
+def _extract_summary_scores(critique_text: str) -> list[str]:
+    """
+    Parses the SUMMARY SCORES section to extract PASS/FAIL per summary.
+    Returns list of "PASS" or "FAIL" strings, one per summary.
+    """
+    scores = []
+    lines  = critique_text.split("\n")
+
+    for line in lines:
+        line_upper = line.upper()
+        # Look for lines matching "- Summary N: PASS/FAIL"
+        if "SUMMARY" in line_upper and ("PASS" in line_upper or "FAIL" in line_upper):
+            if "FAIL" in line_upper:
+                scores.append("FAIL")
+            else:
+                scores.append("PASS")
+
+    # If parsing failed, return empty list
+    return scores if scores else []
