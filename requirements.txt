@@ -1,0 +1,26 @@
+
+# Python 3.11+ required
+
+# Provides: SystemMessage, HumanMessage used in every agent
+langchain>=1.2.15
+
+# Provides: langchain_core.messages
+langchain-core>=1.2.26
+
+# Provides: ChatGroq
+langchain-groq>=1.1.2
+
+# Provides: StateGraph, END
+# Handles: shared state, conditional routing, loop-back edges, operator.add field merging across agent nodes
+langgraph>=1.1.6
+
+# Provides: DDGS context manager
+ddgs>=9.13.0
+
+# Provides: st.*
+# Handles: session_state, streaming updates, layout, widgets
+streamlit>=1.56.0
+
+python-dotenv>=1.2.2
+
+pydantic>=2.12.5
