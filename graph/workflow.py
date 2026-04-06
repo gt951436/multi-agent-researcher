@@ -135,6 +135,7 @@ def run_research(query: str) -> dict:
         "sources":             [],
         "summaries":           [],
         "critique":            "",
+        "summary_scores":      [],
         "needs_more_research": False,
         "research_loops":      0,
         "final_report":        "",

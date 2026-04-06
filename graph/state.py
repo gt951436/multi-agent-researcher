@@ -40,6 +40,7 @@ class ResearchState(TypedDict):
 
     # Critic output
     critique: str                       # Critic's feedback text
+    summary_scores: List[str]   # ["PASS", "FAIL", "PASS", ...] per summary
     needs_more_research: bool           # True = loop back to Researcher
     research_loops: int                 # Counter: prevents infinite loops
 
