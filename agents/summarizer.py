@@ -8,120 +8,141 @@ def summarizer_agent(state: ResearchState) -> dict:
     The Summarizer Agent — third node in the LangGraph pipeline.
 
     Responsibility:
-        For each entry in research_data, synthesize the raw key_facts
-        (bullet points extracted by the Researcher) into a coherent,
-        well-structured paragraph summary.
+        Synthesizes research evidence into clear, authoritative prose summaries,
+        exactly one summary per sub-question.
 
-    Why it exists as a separate agent:
-        - Researcher outputs fragmented bullet points
-        - Writer needs polished, narrative-ready prose
-        - Critic needs structured summaries to evaluate for gaps
-        - Separation of concerns: extraction ≠ synthesis
+    Key Architectural Principles:
+        1. Question ID Association: Every summary is strictly tagged with its question_id (e.g. Q1).
+        2. Incremental Refresh: On re-research passes, questions with newly acquired evidence
+           are updated with combined synthesis. Questions without new evidence retain their
+           existing high-quality summaries, avoiding redundant LLM calls and token waste.
+        3. Deterministic Cardinality: len(summaries) strictly equals len(sub_questions),
+           permanently preventing duplicate accumulation or position-mismatch bugs.
 
-    Reads from state: research_data
-    Writes to state: summaries, status_log
-
-    Args:
-        state: The shared ResearchState
-
-    Returns:
-        dict with keys: summaries, status_log
+    Reads from state: sub_questions, research_data, summaries, research_loops
+    Writes to state:  summaries, status_log
     """
     print("\n[SUMMARIZER] Starting synthesis of research data...")
 
-    research_data = state["research_data"]
+    sub_questions  = state.get("sub_questions", [])
+    research_data  = state.get("research_data", [])
+    prev_summaries = state.get("summaries", [])
+    research_loops = state.get("research_loops", 0)
 
-    # Safety check: if researcher found nothing, handle gracefully
-    if not research_data:
+    if not research_data and not prev_summaries:
         print("[SUMMARIZER] No research data found in state.")
         return {
             "summaries": [],
             "status_log": ["Summarizer: No research data available to summarize."]
         }
 
-    # temperature=0.4 -> slightly higher than factual agents
-    # Allows fluent, natural prose while staying grounded in facts
     llm = get_llm(temperature=0.4)
 
+    # Index existing summaries by question_id: qid -> summary dict
+    existing_summary_map = {}
+    for s in prev_summaries:
+        qid = s.get("question_id")
+        if qid:
+            existing_summary_map[qid] = s
+
+    # Group all collected evidence by question_id
+    evidence_by_qid = {}
+    for entry in research_data:
+        qid = entry.get("question_id")
+        if not qid:
+            continue
+        if qid not in evidence_by_qid:
+            evidence_by_qid[qid] = []
+        evidence_by_qid[qid].append(entry)
+
     all_summaries = []
+    synthesized_count = 0
+    reused_count = 0
 
-    for i, entry in enumerate(research_data, 1):
-        question   = entry.get("question", "Unknown question")
-        key_facts  = entry.get("key_facts", "No facts available")
-        result_count = entry.get("result_count", 0)
+    for i, item in enumerate(sub_questions, 1):
+        if isinstance(item, dict):
+            qid = item.get("id", f"Q{i}")
+            question = item.get("question", str(item))
+        else:
+            qid = f"Q{i}"
+            question = str(item)
 
-        print(f"\n[SUMMARIZER] Synthesizing entry {i}/{len(research_data)}:")
-        print(f"  Question: {question[:80]}...")
+        entries = evidence_by_qid.get(qid, [])
 
-        # Handle case where Researcher found no results for this question
-        if result_count == 0 or key_facts == "No search results were found for this question.":
-            print(f"  [SUMMARIZER] No data available — flagging as gap")
+        # Check if we have new evidence for this question from the current pass
+        has_new_evidence = any(e.get("iteration", 0) == research_loops for e in entries) if research_loops > 0 else True
+
+        # If question already has an approved summary and NO new evidence was gathered for it, reuse it
+        if qid in existing_summary_map and not has_new_evidence:
+            print(f"  [SUMMARIZER] [{qid}] Reusing existing summary (no new evidence needed)")
+            all_summaries.append(existing_summary_map[qid])
+            reused_count += 1
+            continue
+
+        print(f"\n[SUMMARIZER] Synthesizing summary for [{qid}]: {question[:80]}...")
+
+        # If no results were found across all passes for this question
+        valid_entries = [e for e in entries if e.get("result_count", 0) > 0 and e.get("key_facts") != "No search results were found for this question."]
+        if not valid_entries:
+            print(f"  [SUMMARIZER] [{qid}] No valid evidence found — flagging as research gap")
             all_summaries.append({
+                "question_id": qid,
                 "question": question,
-                "summary":  "RESEARCH GAP: No web results were found for this sub-question. "
-                            "This area requires additional investigation.",
-                "has_gap":  True
+                "summary":  f"RESEARCH GAP: Insufficient web evidence retrieved for '{question}'. Additional investigation recommended.",
+                "has_gap":  True,
+                "iteration": research_loops
             })
             continue
 
-        # --- System Prompt ---
-        # We tell the LLM its role: synthesizer, not analyst.
-        # It should convert bullet facts into readable prose —
-        # not add new information or opinions.
+        # Combine facts from all evidence entries for this question
+        facts_sections = []
+        for e in entries:
+            tag = "Targeted Gap Search Facts" if e.get("is_targeted_gap") else "Initial Research Facts"
+            iter_num = e.get("iteration", 0)
+            facts_sections.append(f"--- {tag} (Pass #{iter_num}) ---\n{e.get('key_facts', '')}")
+
+        combined_facts = "\n\n".join(facts_sections)
+
         system_prompt = SystemMessage(content="""You are an expert research synthesizer.
-
-Your job is to transform a list of extracted research facts into a clear, 
-coherent, and well-structured summary paragraph.
-
+Your job is to transform extracted research facts into a clear, authoritative, coherent summary paragraph.
 Rules:
 - Write in clear, professional prose (NOT bullet points)
-- Only use information from the provided facts — do NOT add outside knowledge
-- Preserve all specific details: names, dates, numbers, statistics
-- If facts contain contradictions, acknowledge them in your summary
-- If facts are sparse or incomplete, note this briefly at the end
-- Length: 3-5 sentences for simple topics, up to 8 for complex ones
-- Start directly with the summary — no preamble like "Here is a summary..."
-- Write in third person, past or present tense (be consistent)
+- Only use information from the provided facts — do NOT hallucinate outside claims
+- Preserve specific details: names, numbers, statistics, benchmarks, dates
+- If facts contain contradictions across passes or sources, acknowledge the nuance
+- Length: 3 to 6 comprehensive sentences
+- Start directly with the synthesized prose without introductory filler
 """)
 
-        # --- Human Prompt ---
-        # Injects the specific question and its extracted facts
         human_prompt = HumanMessage(content=f"""Research question: {question}
 
-Extracted facts from web research:
-{key_facts}
+Extracted research facts from web sources:
+{combined_facts}
 
-Write a coherent paragraph summary that synthesizes these facts 
-into a clear answer to the research question.""")
+Synthesize these facts into an authoritative, coherent paragraph summary answering the research question:""")
 
-        # LLM call — synthesizes bullet facts into prose summary
-        response   = llm.invoke([system_prompt, human_prompt])
-        summary    = response.content.strip()
+        response = llm.invoke([system_prompt, human_prompt])
+        summary = response.content.strip()
 
-        print(f"  [SUMMARIZER] Summary generated ({len(summary)} chars)")
-
+        print(f"  [SUMMARIZER] [{qid}] Summary generated ({len(summary)} chars)")
         all_summaries.append({
+            "question_id": qid,
             "question": question,
-            "summary":  summary,
-            "has_gap":  False   # no gap — we have a real summary
+            "summary": summary,
+            "has_gap": False,
+            "iteration": research_loops
         })
+        synthesized_count += 1
 
-    # Count how many summaries have gaps (for status log)
-    gap_count  = sum(1 for s in all_summaries if s.get("has_gap", False))
-    good_count = len(all_summaries) - gap_count
+    gap_count = sum(1 for s in all_summaries if s.get("has_gap", False))
 
-    print(f"\n[SUMMARIZER] Synthesis complete:")
-    print(f"  Summaries generated: {good_count}")
-    print(f"  Gaps flagged:        {gap_count}")
-
-   # Confirm what we're returning
+    print(f"\n[SUMMARIZER] Synthesis complete: {synthesized_count} synthesized, {reused_count} reused, {gap_count} gaps.")
     status_entry = (
-        f"Summarizer: Synthesized {good_count} summaries, "
-        f"flagged {gap_count} research gaps."
+        f"Summarizer: Generated {len(all_summaries)} summaries "
+        f"({synthesized_count} refreshed, {gap_count} gaps, pass #{research_loops})"
     )
-    print(f"  Status log: {status_entry}")
 
     return {
-        "summaries":   all_summaries,
-        "status_log":  [status_entry]   # must be a list — operator.add merges it
+        "summaries": all_summaries,
+        "status_log": [status_entry]
     }

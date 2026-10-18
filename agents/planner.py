@@ -65,20 +65,26 @@ Generate 3-5 focused sub-questions to guide comprehensive research on this topic
     # "1. What is...?\n2. How does...?\n3. Why are...?"
     # We split by newlines and extract each numbered line.
     raw_output = response.content.strip()
-    sub_questions = _parse_sub_questions(raw_output)
-    
-    print(f"[PLANNER] Generated {len(sub_questions)} sub-questions:")
-    for i, q in enumerate(sub_questions, 1):
-        print(f"  {i}. {q}")
+    parsed_questions = _parse_sub_questions(raw_output)
 
-    # --- Return only the fields this agent is responsible for ---
-    # LangGraph merges this dict into the shared state.
-    # 'status_log' uses operator.add, so our new entry APPENDS
-    # to whatever is already in the log — it doesn't overwrite.
+    # Assign stable question IDs (Q1, Q2, ...) so all downstream agents
+    # (Researcher, Summarizer, Critic, Writer) reference questions by ID
+    # rather than relying on brittle list positional indices.
+    sub_questions = [
+        {"id": f"Q{i}", "question": q}
+        for i, q in enumerate(parsed_questions, 1)
+    ]
+
+    print(f"[PLANNER] Generated {len(sub_questions)} structured sub-questions:")
+    for item in sub_questions:
+        print(f"  [{item['id']}] {item['question']}")
+
+    # Return structured sub-questions and status log
     return {
         "sub_questions": sub_questions,
         "status_log": [f"Planner: Generated {len(sub_questions)} sub-questions for query: '{query}'"]
     }
+
 
 def _parse_sub_questions(raw_text: str) -> list[str]:
     """

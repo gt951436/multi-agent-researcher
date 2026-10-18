@@ -35,15 +35,18 @@ def writer_agent(state: ResearchState) -> dict:
     Returns:
         dict with keys: final_report, status_log
     """
-    print("\n[WRITER] Starting final report compilation...")
-
-    # --- Extract everything needed from state ---
+    print("\n[WRITER] Starting final report compilation...")    # --- Extract everything needed from state ---
     query          = state["query"]
-    sub_questions  = state["sub_questions"]
-    summaries      = state["summaries"]
-    sources        = state["sources"]
+    sub_questions  = state.get("sub_questions", [])
+    summaries      = state.get("summaries", [])
+    sources        = state.get("sources", [])
     critique       = state.get("critique", "")
+    summary_scores = state.get("summary_scores", [])
     research_loops = state.get("research_loops", 0)
+
+    # Deduplicate sources preserving insertion order
+    unique_sources = list(dict.fromkeys(sources))
+    source_count   = len(unique_sources)
 
     # --- Safety check ---
     if not summaries:
@@ -51,32 +54,26 @@ def writer_agent(state: ResearchState) -> dict:
         fallback_report = _generate_fallback_report(query)
         return {
             "final_report": fallback_report,
+            "confidence": "Low",
             "status_log": ["Writer: Generated fallback report (no summaries available)."]
         }
 
     # --- Build the structured content block ---
-    # We format summaries + sub-questions into a clear, numbered
-    # content block that the LLM can use as the report's skeleton.
-    # Each entry maps: sub-question → its synthesized summary.
+    # Map each question to its latest summary using question_id
     content_block = _format_content_for_writer(sub_questions, summaries)
 
     # --- Build the sources block ---
-    # Format collected URLs as a numbered reference list.
-    # We deduplicate and limit to 20 to keep the report clean.
-    sources_block = _format_sources_block(sources)
+    # Format unique collected URLs as a numbered reference list.
+    sources_block = _format_sources_block(unique_sources)
 
     # --- Determine confidence level ---
-    # Based on how many research loops ran and whether the Critic
-    # found significant issues. This gives the reader an honest
-    # signal about how much to trust the report.
-    confidence = _determine_confidence(research_loops, critique, summaries)
+    confidence = _determine_confidence(research_loops, critique, summaries, summary_scores)
 
     # --- Generate timestamp ---
     timestamp = datetime.now().strftime("%B %d, %Y at %H:%M")
 
     # --- System Prompt ---
     # Writer's role: architect of the final document.
-    # It structures, connects, and presents — doesn't invent.
     system_prompt = SystemMessage(content="""You are an expert research writer and report architect.
 
 Your job is to compile a set of research summaries into a single, 
@@ -102,15 +99,14 @@ Writing rules:
 - Do NOT repeat the same information across sections
 - Do NOT add information not present in the provided summaries
 - Do NOT use the sub-question as the section heading verbatim — 
-  convert it into a clean, readable heading (e.g., 
-  "What are the latest architectures?" → "## 1. Architectural Advances")
+  convert it into a clean, readable heading
 - Write the report as if it will be read by a knowledgeable but 
   non-specialist audience
 """)
 
     human_prompt = HumanMessage(content=f"""Research query: {query}
 
-Research content (sub-questions and their synthesized summaries):
+Research content (sub-questions and their latest synthesized summaries):
 {content_block}
 
 Write the research report following the structure in your instructions.
@@ -118,19 +114,13 @@ Do NOT include the sources section — that will be appended separately.
 Do NOT include a Research Notes section — that will be appended separately.
 Just write sections 1 through 5 (title through conclusion).""")
 
-    # temperature=0.5 — highest in the system
-    # Writer needs the most linguistic freedom to produce
-    # natural, varied, readable prose
     llm      = get_llm(temperature=0.5)
     response = llm.invoke([system_prompt, human_prompt])
     report_body = response.content.strip()
 
     print(f"[WRITER] Report body generated ({len(report_body)} chars)")
 
-    # --- Assemble the complete report ---
-    # We append sources, research notes, and metadata AFTER the LLM
-    # generates the body. This gives us full control over the format
-    # of these sections without relying on the LLM to format them.
+    # Assemble the complete report with synchronized source count
     final_report = _assemble_final_report(
         report_body    = report_body,
         sources_block  = sources_block,
@@ -138,7 +128,7 @@ Just write sections 1 through 5 (title through conclusion).""")
         research_loops = research_loops,
         critique       = critique,
         timestamp      = timestamp,
-        source_count   = len(sources)
+        source_count   = source_count
     )
 
     print(f"[WRITER] Final report assembled ({len(final_report)} chars)")
@@ -146,9 +136,10 @@ Just write sections 1 through 5 (title through conclusion).""")
 
     return {
         "final_report": final_report,
+        "confidence":   confidence,
         "status_log": [
             f"Writer: Report compiled successfully. "
-            f"{len(summaries)} sections, {len(sources)} sources, "
+            f"{len(sub_questions)} sections, {source_count} unique sources, "
             f"confidence: {confidence}."
         ]
     }
@@ -159,41 +150,40 @@ Just write sections 1 through 5 (title through conclusion).""")
 # ─────────────────────────────────────────────
 
 def _format_content_for_writer(
-    sub_questions: list[str],
+    sub_questions: list,
     summaries: list[dict]
 ) -> str:
     """
-    Pairs each sub-question with its corresponding summary into
-    a numbered, clearly structured block for the LLM to use
-    as the report skeleton.
-
-    Why pair them explicitly:
-        The LLM needs to know WHICH summary answers WHICH question
-        to generate correctly labeled sections. Without this pairing,
-        it might assign summaries to wrong headings.
-
-    Args:
-        sub_questions: List of sub-question strings from Planner
-        summaries:     List of summary dicts from Summarizer
-
-    Returns:
-        Formatted string with numbered question-summary pairs
+    Pairs each sub-question with its latest summary using stable question IDs.
+    Eliminates zip truncation and guarantees that follow-up summaries are consumed.
     """
+    summary_map = {}
+    for s in summaries:
+        qid = s.get("question_id")
+        if qid:
+            summary_map[qid] = s
+
     blocks = []
+    for i, item in enumerate(sub_questions, 1):
+        if isinstance(item, dict):
+            qid = item.get("id", f"Q{i}")
+            question = item.get("question", str(item))
+        else:
+            qid = f"Q{i}"
+            question = str(item)
 
-    # zip() pairs sub_questions[i] with summaries[i]
-    # If counts differ (edge case), zip stops at the shorter one
-    for i, (question, summary_entry) in enumerate(
-        zip(sub_questions, summaries), 1
-    ):
-        summary_text = summary_entry.get("summary", "No summary available.")
-        has_gap      = summary_entry.get("has_gap", False)
+        # Match by question_id; fallback to positional index if missing
+        summary_entry = summary_map.get(qid)
+        if not summary_entry and (i - 1) < len(summaries):
+            summary_entry = summaries[i - 1]
 
-        gap_note = "\n[NOTE: This section has limited research coverage]" \
-                   if has_gap else ""
+        summary_text = summary_entry.get("summary", "No summary available.") if summary_entry else "No summary available."
+        has_gap      = summary_entry.get("has_gap", False) if summary_entry else True
+
+        gap_note = "\n[NOTE: This section has limited research coverage]" if has_gap else ""
 
         blocks.append(
-            f"SUB-QUESTION {i}: {question}\n"
+            f"SUB-QUESTION {i} [{qid}]: {question}\n"
             f"SUMMARY: {summary_text}"
             f"{gap_note}"
         )
@@ -203,27 +193,16 @@ def _format_content_for_writer(
 
 def _format_sources_block(sources: list[str]) -> str:
     """
-    Formats the collected source URLs into a clean numbered
-    markdown reference list.
-
-    We deduplicate (sources list may have duplicates from multiple
-    research loops).
-
-    Args:
-        sources: List of URL strings from Researcher
-
-    Returns:
-        Markdown-formatted numbered reference list string
+    Formats unique source URLs into a clean numbered markdown reference list.
     """
     if not sources:
         return "_No sources were collected during research._"
 
-    # Deduplicate while preserving order (dict preserves insertion order in Python 3.7+)
+    # Deduplicate while preserving insertion order
     unique_sources = list(dict.fromkeys(sources))
-    display_sources = unique_sources
 
     lines = []
-    for i, url in enumerate(display_sources, 1):
+    for i, url in enumerate(unique_sources, 1):
         lines.append(f"{i}. {url}")
 
     return "\n".join(lines)
@@ -232,43 +211,37 @@ def _format_sources_block(sources: list[str]) -> str:
 def _determine_confidence(
     research_loops: int,
     critique:       str,
-    summaries:      list[dict]
+    summaries:      list[dict],
+    summary_scores: list[str] = None
 ) -> str:
     """
-    Calculates an honest confidence rating using four signals:
-
-    1. How many summaries were flagged as gaps by the Summarizer
-    2. Whether the Critic approved or found issues
-    3. How many research loops were needed before approval
-    4. Whether the Critic found any FAIL scores in individual summaries
+    Calculates an honest confidence rating using structured quality signals:
+    1. Unresolved gaps flagged by Summarizer
+    2. Critic's structured scores and verdict
+    3. Number of re-research passes needed
 
     Scale:
-        High   → 0 gaps + clean APPROVED + 0 loops + all summaries PASS
-        Medium → approved but needed loops OR minor issues found
-        Low    → gaps present OR max loops hit without clean approval
+        High   → 0 gaps + clean APPROVED + 0 loops + 0 fails
+        Medium → approved after re-research loops OR minor non-critical issues
+        Low    → >=2 gaps OR unapproved with remaining critical issues
     """
-    upper      = critique.upper()
-    gap_count  = sum(1 for s in summaries if s.get("has_gap", False))
-    approved   = "APPROVED" in upper
-    fail_count = upper.count(": FAIL")  # from SUMMARY SCORES section
+    upper = critique.upper()
+    gap_count = sum(1 for s in summaries if s.get("has_gap", False))
+    approved = ("NEEDS_MORE_RESEARCH" not in upper and "APPROVED" in upper)
 
-    # --- Low confidence conditions ---
-    if gap_count >= 2:
-        return "Low"
-    if not approved:
-        # Max loops hit without clean approval
-        return "Low"
-    if fail_count >= 3:
+    if summary_scores:
+        fail_count = summary_scores.count("FAIL")
+    else:
+        fail_count = upper.count(": FAIL")
+
+    if gap_count >= 2 or not approved or fail_count >= 3:
         return "Low"
 
-    # --- High confidence conditions ---
-    # Must satisfy ALL of: approved + no loops + no gaps + no fails
     if approved and research_loops == 0 and gap_count == 0 and fail_count == 0:
         return "High"
 
-    # --- Medium: everything else ---
-    # Approved but needed loops, or approved with minor issues
     return "Medium"
+
 
 
 def _assemble_final_report(

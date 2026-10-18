@@ -1,6 +1,30 @@
+import json
+from typing import List, Literal, Optional
+from pydantic import BaseModel, Field
 from langchain_core.messages import SystemMessage, HumanMessage
 from config.settings import get_llm, MAX_RESEARCH_LOOPS
 from graph.state import ResearchState
+
+
+class QuestionReview(BaseModel):
+    """Evaluation of an individual sub-question summary."""
+    question_id: str = Field(description="ID of the sub-question reviewed, e.g. Q1, Q2")
+    status: Literal["PASS", "FAIL"] = Field(description="PASS if specific, complete, recent, and deep; FAIL otherwise")
+    reason: str = Field(description="Specific, one-sentence rationale for the PASS or FAIL score")
+    gaps: List[str] = Field(default_factory=list, description="Specific missing evidence points or shortcomings")
+    follow_up_query: Optional[str] = Field(
+        default=None,
+        description="Targeted web search query designed specifically to find the missing evidence if status is FAIL"
+    )
+
+
+class CriticEvaluation(BaseModel):
+    """Strict editorial quality evaluation across all research summaries."""
+    verdict: Literal["APPROVED", "NEEDS_MORE_RESEARCH"] = Field(
+        description="NEEDS_MORE_RESEARCH if >=2 summaries fail or 1 has a major failure (specificity/completeness); APPROVED otherwise"
+    )
+    reviews: List[QuestionReview] = Field(description="Review for each individual sub-question")
+    overall_assessment: str = Field(description="2-3 sentence blunt editorial assessment naming strengths and weaknesses")
 
 
 def critic_agent(state: ResearchState) -> dict:
@@ -8,271 +32,212 @@ def critic_agent(state: ResearchState) -> dict:
     The Critic Agent — fourth node in the LangGraph pipeline.
 
     Responsibility:
-        Evaluates all summaries for completeness, specificity, and
-        internal consistency. Decides whether research quality is
-        sufficient to proceed to writing, or needs another loop.
+        Evaluates all summaries for completeness, specificity, recency,
+        and depth against a strict rubric using structured Pydantic output.
+        Identifies exact gaps and formulates targeted follow-up queries
+        for the Researcher if re-research is needed.
 
-    Why this agent exists:
-        Without quality control, the Writer blindly compiles whatever
-        the Summarizer produced — even if some summaries are vague,
-        incomplete, or contradictory. The Critic catches these issues
-        and triggers targeted re-research before the final report.
-
-    The loop-back mechanism:
+    Loop-back mechanism:
         If needs_more_research=True AND research_loops < MAX_RESEARCH_LOOPS:
-            → LangGraph routes back to Researcher
+            → LangGraph routes to Researcher (targeted gap search)
         Else:
             → LangGraph routes forward to Writer
-        This logic lives in graph/workflow.py (Step 8), not here.
-        The Critic only evaluates — it doesn't control routing.
-
-    Reads from state:  summaries, research_loops
-    Writes to state:   critique, needs_more_research, research_loops,
-                       status_log
-
-    Args:
-        state: The shared ResearchState
-
-    Returns:
-        dict with keys: critique, needs_more_research,
-                        research_loops, status_log
     """
     print("\n[CRITIC] Starting quality review of summaries...")
 
-    summaries       = state["summaries"]
-    research_loops  = state.get("research_loops", 0)
-    original_query  = state["query"]
+    summaries      = state.get("summaries", [])
+    research_loops = state.get("research_loops", 0)
+    original_query = state.get("query", "")
 
-    # --- Safety check ---
+    # Safety check: if no summaries exist, cannot evaluate
     if not summaries:
         print("[CRITIC] No summaries to evaluate — forcing forward to Writer.")
         return {
             "critique":            "No summaries available to critique.",
+            "critic_review":       None,
+            "follow_up_queries":   [],
+            "summary_scores":      [],
             "needs_more_research": False,
             "research_loops":      research_loops,
             "status_log": ["Critic: No summaries found — skipping review."]
         }
 
-    # --- Check if we've hit the loop limit ---
-    # Even if the Critic finds gaps, we can't loop forever.
-    # After MAX_RESEARCH_LOOPS attempts, we proceed to Writer with
-    # whatever we have, noting the limitation in the critique.
+    # Loop limit guard: stop looping once maximum allowed passes are reached
     if research_loops >= MAX_RESEARCH_LOOPS:
-        print(f"[CRITIC] Max research loops ({MAX_RESEARCH_LOOPS}) reached")
-        print("[CRITIC] Proceeding to Writer despite any remaining gaps.")
+        print(f"[CRITIC] Max research loops ({MAX_RESEARCH_LOOPS}) reached.")
+        print("[CRITIC] Proceeding to Writer with notes on remaining limitations.")
         return {
-            "critique":  (         f"Maximum research loops ({MAX_RESEARCH_LOOPS}) reached. "
-                                   f"Proceeding to final report with available research. "
-                                   f"Some gaps may remain."),
-            "needs_more_research": False,   # force forward regardless
+            "critique": (
+                f"Maximum research loops ({MAX_RESEARCH_LOOPS}) reached. "
+                f"Proceeding to final report with available research. "
+                f"Some gaps may remain."
+            ),
+            "critic_review":       None,
+            "follow_up_queries":   [],
+            "summary_scores":      state.get("summary_scores", ["PASS"] * len(summaries)),
+            "needs_more_research": False,
             "research_loops":      research_loops,
             "status_log": [
-                f"Critic: Max loops reached ({MAX_RESEARCH_LOOPS}). "
-                f"Proceeding to Writer."
+                f"Critic: Max loops reached ({MAX_RESEARCH_LOOPS}). Proceeding to Writer."
             ]
         }
 
-    # --- Format summaries for the LLM ---
-    # We render all summaries as a numbered list so the LLM can
-    # reference specific ones by number in its critique.
     formatted_summaries = _format_summaries_for_critique(summaries)
 
-    # --- System Prompt ---
-    # The Critic's role is evaluator, not improver.
-    # It identifies problems and articulates them precisely —
-    # it does NOT rewrite or fix the summaries itself.
-    system_prompt = SystemMessage(content="""You are a demamding, rigorous, skeptical research quality reviewer and editor at a high-standard publication. Your job is to reject mediocre research.
+    system_prompt = SystemMessage(content="""You are a demanding, rigorous, skeptical research quality reviewer and editor at a high-standard publication. Your job is to reject mediocre research.
 
-Your job is to evaluate a set of research summaries and determine if they 
-provide sufficient, accurate, and complete coverage of the original research query.
+Your job is to evaluate each research summary and determine if they provide sufficient, accurate, and complete coverage of the original research query.
 
 Evaluate each summary against this strict rubric:
 
 CRITERION 1 — SPECIFICITY (most important)
-FAIL if the summary:
-  • Uses vague phrases like "various methods", "several approaches", "many researchers"
-    without naming them specifically
-  • Makes claims without concrete supporting evidence (numbers, names, dates, studies)
-  • Could apply to almost any topic in the field (generic filler)
+FAIL if the summary uses vague phrases without specifics, makes claims without concrete evidence (numbers, names, dates), or contains generic filler.
 
-CRITERION 2 — COMPLETENESS  
-FAIL if the summary:
-  • Does not actually answer its specific sub-question
-  • Says things like "details not available", "not fully specified", "may vary"
-  • Covers only part of what the sub-question asks
+CRITERION 2 — COMPLETENESS
+FAIL if the summary does not actually answer its specific sub-question, or leaves major aspects unaddressed.
 
 CRITERION 3 — RECENCY
-FAIL if the summary:
-  • Cites only general background knowledge with no recent developments
-  • Refers primarily to research older than 2 years without noting this
-  • Misses obviously recent and important developments in a fast-moving topic
+FAIL if the summary cites only general background knowledge with no recent developments in a fast-moving topic.
 
 CRITERION 4 — DEPTH
-FAIL if the summary:
-  • Only provides surface-level definitions (what something IS, not how it WORKS)
-  • Lacks any analytical insight or meaningful comparison
-  • Is shorter than 3 substantial sentences
+FAIL if the summary provides only surface-level definitions without mechanism or comparison, or is shorter than 3 substantial sentences.
 
-SCORING:
-- If 2 or more summaries FAIL any criterion → NEEDS_MORE_RESEARCH
-- If 1 summary has a MAJOR failure (Criterion 1 or 2) → NEEDS_MORE_RESEARCH  
-- If all summaries pass all criteria → APPROVED
-- If 1 summary has only a minor issue → APPROVED with note
-
-You MUST respond in exactly this format:
-
-VERDICT: APPROVED or NEEDS_MORE_RESEARCH
-
-SUMMARY SCORES:
-- Summary 1: PASS/FAIL — [one sentence reason]
-- Summary 2: PASS/FAIL — [one sentence reason]
-- Summary 3: PASS/FAIL — [one sentence reason]
-- Summary 4: PASS/FAIL — [one sentence reason]
-- Summary 5: PASS/FAIL — [one sentence reason]
-
-ISSUES FOUND:
-- [list specific issues, or "None" if all pass]
-
-SPECIFIC GAPS TO ADDRESS:
-- [list what the Researcher should search for next, or "None" if approved]
-
-OVERALL ASSESSMENT:
-[2-3 sentences. Be blunt. Name specific weaknesses.]
+SCORING RULES:
+- If 2 or more summaries FAIL any criterion → verdict: NEEDS_MORE_RESEARCH
+- If 1 summary has a MAJOR failure (Criterion 1 or 2) → verdict: NEEDS_MORE_RESEARCH
+- If all summaries pass all criteria → verdict: APPROVED
+- For every summary that FAILS, you MUST provide a concrete, targeted 'follow_up_query' that the researcher can execute on Google/DuckDuckGo to retrieve the missing information.
 """)
 
     human_prompt = HumanMessage(content=f"""Original research query: {original_query}
 
 Research summaries to evaluate:
-
 {formatted_summaries}
 
-Apply the strict rubric. Be a tough editor. Find the weaknesses.""")
+Apply the strict rubric. For every summary that fails, provide a targeted follow-up search query to fill the gap.""")
 
-    # temperature=0.1 — Critic must be consistent and deterministic
-    # We don't want random variation in quality assessments
-    llm      = get_llm(temperature=0.1)
-    response = llm.invoke([system_prompt, human_prompt])
-    critique = response.content.strip()
+    llm = get_llm(temperature=0.1)
 
-    print(f"[CRITIC] Evaluation complete ({len(critique)} chars)")
+    # Invoke with structured output backed by Pydantic
+    try:
+        structured_llm = llm.with_structured_output(CriticEvaluation)
+        evaluation: CriticEvaluation = structured_llm.invoke([system_prompt, human_prompt])
+    except Exception as e:
+        print(f"[CRITIC] Structured output invocation failed: {e}. Attempting JSON fallback...")
+        evaluation = _fallback_json_critique(llm, system_prompt, human_prompt, summaries)
 
-    # --- Parse the verdict ---
-    # We look for "VERDICT: APPROVED" or "VERDICT: NEEDS_MORE_RESEARCH"
-    # in the LLM's response to determine the routing decision.
-    needs_more_research = _parse_verdict(critique)
-    summary_scores = _extract_summary_scores(critique)
-    
+    needs_more_research = (evaluation.verdict == "NEEDS_MORE_RESEARCH")
+    summary_scores = [r.status for r in evaluation.reviews]
+    fail_count = summary_scores.count("FAIL")
+
+    # Extract targeted follow-up queries for failed questions
+    follow_up_queries = []
     if needs_more_research:
-        fail_count = sum(1 for s in summary_scores if s == "FAIL")
-        print(f"[CRITIC] VERDICT: NEEDS MORE RESEARCH ({fail_count} summaries failed)")
-        print(f"[CRITIC] Will trigger research loop #{research_loops + 1}")
-    else:
-        fail_count = sum(1 for s in summary_scores if s == "FAIL")
-        print(f"[CRITIC] VERDICT: APPROVED "
-              f"({'all passed' if fail_count == 0 else f'{fail_count} minor issue(s)'})")
+        for r in evaluation.reviews:
+            if r.status == "FAIL":
+                query_str = r.follow_up_query or f"{original_query} {r.question_id} details"
+                follow_up_queries.append({
+                    "question_id": r.question_id,
+                    "query": query_str,
+                    "gaps": r.gaps,
+                    "rationale": r.reason
+                })
 
-    new_loop_count = research_loops + 1 if needs_more_research else research_loops
+    critique_markdown = _format_critique_markdown(evaluation)
+
+    print(f"[CRITIC] Verdict: {evaluation.verdict} ({fail_count}/{len(summaries)} failed)")
+    if follow_up_queries:
+        print(f"[CRITIC] Generated {len(follow_up_queries)} targeted follow-up queries:")
+        for fq in follow_up_queries:
+            print(f"  [{fq['question_id']}] {fq['query']}")
 
     return {
-        "critique":            critique,
-        "needs_more_research": needs_more_research,
-        "research_loops":      new_loop_count,
+        "critique":            critique_markdown,
+        "critic_review":       evaluation.model_dump(),
+        "follow_up_queries":   follow_up_queries,
         "summary_scores":      summary_scores,
+        "needs_more_research": needs_more_research,
+        "research_loops":      research_loops,
         "status_log": [
-            f"Critic: {'NEEDS_MORE_RESEARCH' if needs_more_research else 'APPROVED'} "
-            f"— {sum(1 for s in summary_scores if s == 'FAIL')}/5 summaries failed "
+            f"Critic: {evaluation.verdict} — {fail_count}/{len(summaries)} summaries failed "
             f"(loop {research_loops}/{MAX_RESEARCH_LOOPS})"
         ]
     }
 
 
 def _format_summaries_for_critique(summaries: list[dict]) -> str:
-    """
-    Renders all summaries into a numbered, clearly separated string
-    so the LLM Critic can reference specific ones in its evaluation.
-
-    Example output:
-        SUMMARY 1:
-        Question: What are the latest architectures...
-        Summary: As of 2025, transformer-based models...
-
-        SUMMARY 2:
-        Question: Which organizations lead...
-        Summary: OpenAI, Google DeepMind, and Meta...
-
-    Args:
-        summaries: List of summary dicts from Summarizer
-
-    Returns:
-        Formatted string ready to inject into the Critic's prompt
-    """
+    """Renders summaries into a clearly structured block labeled with question IDs."""
     formatted = []
     for i, entry in enumerate(summaries, 1):
+        q_id = entry.get("question_id", f"Q{i}")
         question = entry.get("question", "Unknown question")
-        summary  = entry.get("summary",  "No summary available")
-        has_gap  = entry.get("has_gap",  False)
+        summary  = entry.get("summary", "No summary available")
+        has_gap  = entry.get("has_gap", False)
 
         gap_note = " [FLAGGED AS GAP BY SUMMARIZER]" if has_gap else ""
-
         formatted.append(
-            f"SUMMARY {i}{gap_note}:\n"
+            f"SUMMARY {i} [ID: {q_id}]{gap_note}:\n"
             f"Sub-Question: {question}\n"
             f"Content Summary: {summary}"
         )
-
     return "\n\n".join(formatted)
 
 
-def _parse_verdict(critique_text: str) -> bool:
+def _format_critique_markdown(evaluation: CriticEvaluation) -> str:
+    """Generates clean markdown report from structured Critic evaluation."""
+    lines = [
+        f"VERDICT: {evaluation.verdict}\n",
+        "SUMMARY SCORES:"
+    ]
+    for r in evaluation.reviews:
+        lines.append(f"- {r.question_id}: {r.status} — {r.reason}")
+
+    issues = [f"- [{r.question_id}] {gap}" for r in evaluation.reviews for gap in r.gaps]
+    lines.append("\nISSUES FOUND:")
+    lines.append("\n".join(issues) if issues else "- None")
+
+    follow_ups = [f"- [{r.question_id}] {r.follow_up_query}" for r in evaluation.reviews if r.follow_up_query and r.status == "FAIL"]
+    lines.append("\nSPECIFIC GAPS TO ADDRESS:")
+    lines.append("\n".join(follow_ups) if follow_ups else "- None")
+
+    lines.append(f"\nOVERALL ASSESSMENT:\n{evaluation.overall_assessment}")
+    return "\n".join(lines)
+
+
+def _fallback_json_critique(llm, system_prompt, human_prompt, summaries: list[dict]) -> CriticEvaluation:
     """
-    Extracts the binary verdict from the Critic's response text.
-
-    Why a separate parsing function:
-        The LLM returns a full multi-section text. We need to extract
-        one boolean from it. Keeping this logic isolated makes it easy
-        to improve the parser without touching the agent logic.
-
-    Parsing strategy:
-        Look for "VERDICT: NEEDS_MORE_RESEARCH" → True (loop back)
-        Look for "VERDICT: APPROVED"             → False (move forward)
-        Default to False if verdict is ambiguous (don't block pipeline)
-
-    Args:
-        critique_text: The raw LLM critique response string
-
-    Returns:
-        True  = needs another research loop
-        False = approved, proceed to Writer
+    Fallback parser if structured output binding fails.
+    Prompts the LLM for raw JSON and validates with Pydantic.
     """
-    # Normalize to uppercase for case-insensitive matching
-    upper = critique_text.upper()
+    json_prompt = HumanMessage(content=human_prompt.content + "\n\nOutput your response strictly as valid JSON matching the CriticEvaluation schema.")
+    response = llm.invoke([system_prompt, json_prompt])
+    text = response.content.strip()
 
-    if "NEEDS_MORE_RESEARCH" in upper or "NEEDS MORE RESEARCH" in upper:
-        return True
-    elif "APPROVED" in upper:
-        return False
-    else:
-        # Ambiguous verdict — default to proceeding forward
-        # Better to write an imperfect report than to loop infinitely
-        print("[CRITIC] Warning: Ambiguous verdict — defaulting to APPROVED")
-        return False
-    
-def _extract_summary_scores(critique_text: str) -> list[str]:
-    """
-    Parses the SUMMARY SCORES section to extract PASS/FAIL per summary.
-    Returns list of "PASS" or "FAIL" strings, one per summary.
-    """
-    scores = []
-    lines  = critique_text.split("\n")
+    # Clean markdown json fences if present
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+    text = text.strip()
 
-    for line in lines:
-        line_upper = line.upper()
-        # Look for lines matching "- Summary N: PASS/FAIL"
-        if "SUMMARY" in line_upper and ("PASS" in line_upper or "FAIL" in line_upper):
-            if "FAIL" in line_upper:
-                scores.append("FAIL")
-            else:
-                scores.append("PASS")
-
-    # If parsing failed, return empty list
-    return scores if scores else []
+    try:
+        data = json.loads(text)
+        return CriticEvaluation.model_validate(data)
+    except Exception as parse_err:
+        print(f"[CRITIC] JSON parsing failed ({parse_err}). Falling back to safe conservative evaluation.")
+        reviews = []
+        for i, s in enumerate(summaries, 1):
+            qid = s.get("question_id", f"Q{i}")
+            reviews.append(QuestionReview(
+                question_id=qid,
+                status="PASS" if not s.get("has_gap") else "FAIL",
+                reason="Evaluated via fallback parser",
+                gaps=["Review format error, manual verification suggested"] if s.get("has_gap") else [],
+                follow_up_query=None
+            ))
+        verdict = "NEEDS_MORE_RESEARCH" if any(r.status == "FAIL" for r in reviews) else "APPROVED"
+        return CriticEvaluation(
+            verdict=verdict,
+            reviews=reviews,
+            overall_assessment="Automated review encountered formatting anomalies; proceeding with conservative scoring."
+        )

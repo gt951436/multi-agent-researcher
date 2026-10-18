@@ -166,11 +166,15 @@ if run_button and query.strip() and not st.session_state.is_running:
         "sources":             [],
         "summaries":           [],
         "critique":            "",
+        "critic_review":       None,
+        "follow_up_queries":   [],
+        "summary_scores":      [],
         "needs_more_research": False,
         "research_loops":      0,
         "final_report":        "",
         "status_log":          []
     }
+
 
     accumulated_state = {k: v for k, v in initial_state.items()}
 
@@ -267,33 +271,45 @@ if run_button and query.strip() and not st.session_state.is_running:
         st.session_state.final_state = accumulated_state
 
     except Exception as e:
-        st.error(f"Pipeline error: {e}")
-        st.exception(e)
+        st.error(f"⚠️ Research pipeline encountered an error: {e}")
     finally:
         # Always release the running lock — even if an error occurred
         st.session_state.is_running = False
 
     # --- Metrics bar ---
     elapsed_total = (datetime.now() - start_time).seconds
-    sources       = len(set(accumulated_state.get("sources", [])))
+    unique_sources = list(dict.fromkeys(accumulated_state.get("sources", [])))
+    source_count  = len(unique_sources)
     loops         = accumulated_state.get("research_loops", 0)
     report_len    = len(accumulated_state.get("final_report", ""))
-    confidence    = (
-        "🟢 High" if "High" in accumulated_state.get("final_report", "")
-        else "🟡 Medium" if "Medium" in accumulated_state.get("final_report", "")
-        else "🔴 Low"
-    )
+
+    raw_conf = accumulated_state.get("confidence")
+    if not raw_conf:
+        if "| Confidence | 🟢 High" in accumulated_state.get("final_report", ""):
+            raw_conf = "High"
+        elif "| Confidence | 🔴 Low" in accumulated_state.get("final_report", ""):
+            raw_conf = "Low"
+        else:
+            raw_conf = "Medium"
+
+    confidence_display = {
+        "High":   "🟢 High",
+        "Medium": "🟡 Medium",
+        "Low":    "🔴 Low"
+    }.get(raw_conf, "🟡 Medium")
 
     st.markdown("---")
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Time",        f"{elapsed_total}s")
-    m2.metric("Sources",     sources)
+    m2.metric("Sources",     source_count)
     m3.metric("Loops",       loops)
     m4.metric("Report",      f"{report_len} chars")
-    m5.metric("Confidence",  confidence)
+    m5.metric("Confidence",  confidence_display)
+
 
 # Show previous result if no new run triggered
 elif st.session_state.final_state and not st.session_state.is_running:
+
     st.markdown("---")
     st.info(
         f"Showing report for: **{st.session_state.last_query}**  \n"

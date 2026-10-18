@@ -10,154 +10,210 @@ def researcher_agent(state: ResearchState) -> dict:
     """
     The Researcher Agent — second node in the LangGraph pipeline.
 
-    Responsibility:
-        For each sub-question from the Planner, perform a live web
-        search and use the LLM to extract relevant key facts from
-        the raw search results.
+    Dual-Mode Execution:
+        1. Initial Pass (research_loops == 0):
+           Loops over all planned sub-questions from Planner and gathers baseline evidence.
+        2. Targeted Follow-up Pass (research_loops > 0 or follow_up_queries present):
+           Does NOT repeat initial searches. Instead, executes targeted queries generated
+           by the Critic to resolve specific evidence gaps for failed questions.
 
-    Why it loops over sub-questions:
-        Each sub-question covers a distinct angle of the topic.
-        Searching for all of them in one query would produce generic,
-        unfocused results. Individual searches produce targeted, deep
-        information per angle.
-
-    Reads from state: sub_questions, research_loops (for context)
-    Writes to state: research_data (appended), sources (appended),
-                       status_log (appended)
-
-    Note on operator.add:
-        research_data and sources are Annotated with operator.add in
-        the state schema. This means LangGraph MERGES the lists we
-        return with whatever was already in the state. This is critical
-        on loop-back runs - we don't want to wipe the previous research.
-
-    Args:
-        state: The shared ResearchState
-
-    Returns:
-        dict with keys: research_data, sources, status_log
+    Reads from state: sub_questions, follow_up_queries, research_loops
+    Writes to state:  research_data (appended), sources (appended),
+                      research_loops (updated), status_log (appended)
     """
     print("\n[RESEARCHER] Starting web research...")
 
-    sub_questions  = state["sub_questions"]
-    research_loops = state.get("research_loops", 0)
+    sub_questions     = state.get("sub_questions", [])
+    follow_up_queries = state.get("follow_up_queries", [])
+    research_loops    = state.get("research_loops", 0)
 
-    # On loop-back runs (Critic sent us back), the Critic's feedback
-    # is in state["critique"]. We log it so the developer can see
-    # what gaps the Critic identified.
-    if research_loops > 0:
-        print(f"[RESEARCHER] Loop #{research_loops} - addressing critic feedback:")
-        print(f"  {state.get('critique', 'No critique available')}")
+    # Determine execution mode: Initial baseline vs Targeted re-research
+    is_follow_up = len(follow_up_queries) > 0
 
-    # --- Accumulators ---
-    # We collect all research here, then return them all at once.
-    # Because research_data and sources use operator.add in the state
-    # schema, LangGraph will APPEND these to whatever already exists
-    # in state — not replace it.
+    if is_follow_up:
+        current_pass = research_loops + 1
+        print(f"\n[RESEARCHER] Loop #{current_pass} — Targeting {len(follow_up_queries)} specific gaps identified by Critic:")
+        for fq in follow_up_queries:
+            print(f"  [{fq.get('question_id')}] Query: {fq.get('query')}")
+    else:
+        current_pass = 0
+        print(f"\n[RESEARCHER] Initial Pass (Loop #0) — Researching {len(sub_questions)} planned sub-questions")
+
     all_research_data = []
     all_sources       = []
+    llm               = get_llm(temperature=0.1)
 
-    llm = get_llm(temperature=0.1)
+    # Build question lookup map: question_id -> question_text
+    question_map = {}
+    for i, item in enumerate(sub_questions, 1):
+        if isinstance(item, dict):
+            qid = item.get("id", f"Q{i}")
+            qtext = item.get("question", str(item))
+        else:
+            qid = f"Q{i}"
+            qtext = str(item)
+        question_map[qid] = qtext
 
-    # --- Main research loop ---
-    # Process each sub-question independently
-    for i, question in enumerate(sub_questions, 1):
-        print(f"\n[RESEARCHER] Researching sub-question {i}/{len(sub_questions)}:")
-        print(f"  {question}")
+    # --- Mode 1: Targeted Follow-up Research ---
+    if is_follow_up:
+        for i, fq in enumerate(follow_up_queries, 1):
+            qid = fq.get("question_id", f"Q{i}")
+            search_query = fq.get("query", "")
+            gaps = fq.get("gaps", [])
+            original_q = question_map.get(qid, search_query)
 
-        # --- Step A: Web Search ---
-        # Search DuckDuckGo for this specific sub-question
-        raw_results = web_search(question, max_results=5)
+            print(f"\n[RESEARCHER] Targeted Search {i}/{len(follow_up_queries)} for [{qid}]:")
+            print(f"  Target Query: {search_query}")
+            print(f"  Gaps to fill: {', '.join(gaps) if gaps else 'General enhancement'}")
 
-        if not raw_results:
-            # Search returned nothing — record this gracefully
-            # The Summarizer and Critic will flag the gap
-            print(f"  [RESEARCHER] No results found for this question")
-            all_research_data.append({
-                "question":    question,
-                "raw_results": [],
-                "key_facts":   "No search results were found for this question.",
-                "result_count": 0
-            })
-            continue  # move to next sub-question
+            raw_results = web_search(search_query, max_results=5)
 
-        print(f"  [RESEARCHER] Found {len(raw_results)} web results")
+            if not raw_results:
+                print(f"  [RESEARCHER] No results found for follow-up query: '{search_query}'")
+                all_research_data.append({
+                    "id": f"E_{qid}_{current_pass}_{int(time.time())}",
+                    "question_id": qid,
+                    "question": original_q,
+                    "search_query": search_query,
+                    "raw_results": [],
+                    "key_facts": "Follow-up targeted search yielded no new web results.",
+                    "result_count": 0,
+                    "iteration": current_pass,
+                    "is_targeted_gap": True,
+                    "gaps_addressed": gaps
+                })
+                continue
 
-        # --- Step B: Collect source URLs ---
-        # We extract URLs now, before the LLM processes anything,
-        # because we want ALL sources even if the LLM later decides
-        # some snippets aren't relevant.
-        for result in raw_results:
-            url = result.get("url", "")
-            if url and url != "No URL" and url not in all_sources:
-                all_sources.append(url)
+            # Collect source URLs
+            for result in raw_results:
+                url = result.get("url", "")
+                if url and url != "No URL" and url not in all_sources:
+                    all_sources.append(url)
 
-        # --- Step C: LLM processes the raw search results ---
-        # The LLM reads all 5 search snippets and extracts only
-        # the facts that are directly relevant to the sub-question.
-        # This filters noise and makes downstream processing cleaner.
-        formatted_results = format_results_for_llm(raw_results)
+            formatted_results = format_results_for_llm(raw_results)
 
-        system_prompt = SystemMessage(content="""You are a meticulous research analyst.
-
-Your job is to read web search results and extract the most relevant, factual information 
-related to a specific research question.
-
+            system_prompt = SystemMessage(content="""You are a precision research analyst closing factual gaps.
+Extract concrete facts from these search results that directly address the identified missing evidence.
 Rules:
-- Extract ONLY information directly relevant to the question
-- Present facts clearly and concisely as bullet points
-- Preserve specific details: names, dates, numbers, statistics
-- If a source contains contradictory information, note the contradiction
-- Do NOT add your own opinions or knowledge — only use what the sources say
-- Start directly with the bullet points, no preamble
-- Format: use "• " for each bullet point
+- Focus specifically on the identified gaps: names, figures, dates, verified metrics
+- Present facts concisely as bullet points ("• ")
+- Preserve exact technical specifics
+- Do not invent outside facts
 """)
 
-        human_prompt = HumanMessage(content=f"""Research question: {question}
+            human_prompt = HumanMessage(content=f"""Sub-Question: {original_q}
+Search Query: {search_query}
+Gaps to resolve: {gaps}
+
+Search Results:
+{formatted_results}
+
+Extract the facts that resolve the gaps above:""")
+
+            response = llm.invoke([system_prompt, human_prompt])
+            key_facts = response.content.strip()
+
+            all_research_data.append({
+                "id": f"E_{qid}_{current_pass}_{int(time.time())}",
+                "question_id": qid,
+                "question": original_q,
+                "search_query": search_query,
+                "raw_results": raw_results,
+                "key_facts": key_facts,
+                "result_count": len(raw_results),
+                "iteration": current_pass,
+                "is_targeted_gap": True,
+                "gaps_addressed": gaps
+            })
+
+            if i < len(follow_up_queries):
+                time.sleep(2)
+
+    # --- Mode 2: Baseline Initial Research ---
+    else:
+        for i, item in enumerate(sub_questions, 1):
+            if isinstance(item, dict):
+                qid = item.get("id", f"Q{i}")
+                question = item.get("question", str(item))
+            else:
+                qid = f"Q{i}"
+                question = str(item)
+
+            print(f"\n[RESEARCHER] Researching sub-question {i}/{len(sub_questions)} [{qid}]:")
+            print(f"  {question}")
+
+            raw_results = web_search(question, max_results=5)
+
+            if not raw_results:
+                print(f"  [RESEARCHER] No results found for [{qid}]")
+                all_research_data.append({
+                    "id": f"E_{qid}_0_{int(time.time())}",
+                    "question_id": qid,
+                    "question": question,
+                    "search_query": question,
+                    "raw_results": [],
+                    "key_facts": "No search results were found for this question.",
+                    "result_count": 0,
+                    "iteration": 0,
+                    "is_targeted_gap": False,
+                    "gaps_addressed": []
+                })
+                continue
+
+            for result in raw_results:
+                url = result.get("url", "")
+                if url and url != "No URL" and url not in all_sources:
+                    all_sources.append(url)
+
+            formatted_results = format_results_for_llm(raw_results)
+
+            system_prompt = SystemMessage(content="""You are a meticulous research analyst.
+Extract the most relevant, factual information from web search results for the given research question.
+Rules:
+- Extract ONLY information directly relevant to the question
+- Present facts clearly and concisely as bullet points ("• ")
+- Preserve specific details: names, dates, numbers, statistics
+- Note any contradictions across sources
+- Start directly with the bullet points, no preamble
+""")
+
+            human_prompt = HumanMessage(content=f"""Research question: {question}
 
 Web search results:
 {formatted_results}
 
-Extract the key facts from these search results that are relevant to the research question.
-Present them as clear bullet points.""")
+Extract the key facts relevant to this question:""")
 
-        # LLM call — extracts structured facts from noisy web snippets
-        response = llm.invoke([system_prompt, human_prompt])
-        key_facts = response.content.strip()
+            response = llm.invoke([system_prompt, human_prompt])
+            key_facts = response.content.strip()
 
-        print(f"  [RESEARCHER] Extracted key facts ({len(key_facts)} chars)")
+            all_research_data.append({
+                "id": f"E_{qid}_0_{int(time.time())}",
+                "question_id": qid,
+                "question": question,
+                "search_query": question,
+                "raw_results": raw_results,
+                "key_facts": key_facts,
+                "result_count": len(raw_results),
+                "iteration": 0,
+                "is_targeted_gap": False,
+                "gaps_addressed": []
+            })
 
-        # --- Step D: Store structured result ---
-        all_research_data.append({
-            "question":     question,
-            "raw_results":  raw_results,        # original search results
-            "key_facts":    key_facts,           # LLM-extracted, filtered facts
-            "result_count": len(raw_results)
-        })
+            if i < len(sub_questions):
+                time.sleep(2)
 
-        # --- Rate limiting ---
-        # DuckDuckGo will temporarily block us if we fire too many
-        # requests in rapid succession. A 2-second pause between
-        # searches keeps us well within their tolerance.
-        # This is standard practice for any scraping/search pipeline.
-        
-        if i < len(sub_questions):  # no need to wait after the last one
-            print(f"  [RESEARCHER] Waiting 2s before next search...")
-            time.sleep(2)
-
-    # --- Summary log ---
-    total_sources  = len(all_sources)
-    total_questions = len(all_research_data)
-    print(f"\n[RESEARCHER] Research complete:")
-    print(f"  Sub-questions researched: {total_questions}")
-    print(f"  Sources collected: {total_sources}")
+    total_sources = len(all_sources)
+    total_entries = len(all_research_data)
+    print(f"\n[RESEARCHER] Research completed: {total_entries} queries searched, {total_sources} new sources collected (pass #{current_pass}).")
 
     return {
         "research_data": all_research_data,
         "sources":       all_sources,
+        "research_loops": current_pass,
+        "follow_up_queries": [],  # Clear follow_up_queries now that they are executed
         "status_log": [
-            f"Researcher: Completed research on {total_questions} sub-questions, "
-            f"collected {total_sources} sources "
-            f"(loop #{research_loops})"
+            f"Researcher: Completed {'targeted re-research' if is_follow_up else 'initial research'} "
+            f"({total_entries} items, {total_sources} sources, pass #{current_pass})"
         ]
     }
