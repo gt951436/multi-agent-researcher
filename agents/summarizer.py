@@ -105,21 +105,24 @@ def summarizer_agent(state: ResearchState) -> dict:
 
         system_prompt = SystemMessage(content="""You are an expert research synthesizer.
 Your job is to transform extracted research facts into a clear, authoritative, coherent summary paragraph.
-Rules:
+
+CRITICAL INSTRUCTIONS:
 - Write in clear, professional prose (NOT bullet points)
-- Only use information from the provided facts — do NOT hallucinate outside claims
-- Preserve specific details: names, numbers, statistics, benchmarks, dates
-- If facts contain contradictions across passes or sources, acknowledge the nuance
-- Length: 3 to 6 comprehensive sentences
-- Start directly with the synthesized prose without introductory filler
+- You MUST preserve all source citation markers (e.g. [S1], [S2], [S1, S3]) directly attached to their respective factual statements in the prose.
+- Example: "Recent experimental evaluations demonstrated 127-qubit coherence [S1], though cryogenic heat dissipation remains an unresolved obstacle to scaling [S2, S3]."
+- Only use information from the provided facts — do NOT hallucinate outside claims.
+- Preserve specific details: names, numbers, statistics, benchmarks, dates.
+- Length: 3 to 6 comprehensive sentences.
+- Start directly with the synthesized prose without introductory filler.
 """)
 
         human_prompt = HumanMessage(content=f"""Research question: {question}
 
-Extracted research facts from web sources:
+Extracted research facts with source citations:
 {combined_facts}
 
-Synthesize these facts into an authoritative, coherent paragraph summary answering the research question:""")
+Synthesize these facts into an authoritative, coherent paragraph summary answering the research question. Preserve source citation tags [S_n] on every material statement:""")
+
 
         response = llm.invoke([system_prompt, human_prompt])
         summary = response.content.strip()

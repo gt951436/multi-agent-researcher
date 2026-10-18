@@ -2,6 +2,17 @@ from typing import TypedDict, Annotated, List, Optional, Union
 import operator
 
 
+class SourceItem(TypedDict):
+    """Normalized metadata for a retrieved web source."""
+    source_id: str          # Stable reference ID, e.g. "S1", "S2"
+    url: str                # Canonical source URL
+    title: str              # Document or page title
+    domain: str             # Normalized domain name (e.g. nature.com)
+    snippet: str            # Original search snippet
+    content_type: str       # "full_text" | "snippet"
+    retrieved_at: str       # Timestamp when retrieved
+
+
 class SubQuestion(TypedDict):
     """Structured representation of a planned research question."""
     id: str         # Stable identifier, e.g. "Q1", "Q2"
@@ -13,8 +24,9 @@ class EvidenceItem(TypedDict):
     id: str                 # Unique evidence ID, e.g. "E1"
     question_id: str        # Associated question ID (e.g. "Q1")
     question: str           # The query or sub-question searched
+    source_ids: List[str]   # List of supporting source IDs, e.g. ["S1", "S2"]
     raw_results: List[dict] # Search snippets, titles, and URLs
-    key_facts: str          # LLM-extracted factual bullet points
+    key_facts: str          # LLM-extracted factual bullet points with inline [S_n] citations
     result_count: int       # Number of raw search results returned
     iteration: int          # Which research pass captured this (0 = initial, 1+ = re-research)
     is_targeted_gap: bool   # True if this was an explicit gap-fill search
@@ -24,7 +36,7 @@ class SummaryItem(TypedDict):
     """Synthesized summary for a specific sub-question."""
     question_id: str        # Matches SubQuestion id, e.g. "Q1"
     question: str           # The sub-question text
-    summary: str            # Synthesized narrative summary
+    summary: str            # Synthesized narrative summary with citation markers
     has_gap: bool           # True if evidence was missing or insufficient
     iteration: int          # Latest iteration that updated this summary
 
@@ -46,6 +58,7 @@ class ResearchState(TypedDict):
     - sub_questions: Structured list of questions (each with stable 'id' and 'question')
     - research_data: Accumulated evidence items across all passes (appended via operator.add)
     - sources: Deduplicated list of source URLs collected (appended via operator.add)
+    - source_registry: Structured source records with metadata and content_type (appended via operator.add)
     - summaries: Latest summary per question ID (replaced by Summarizer each pass)
     - critique: Human-readable markdown feedback from Critic
     - critic_review: Structured machine-readable Critic evaluation
@@ -54,6 +67,7 @@ class ResearchState(TypedDict):
     - needs_more_research: Boolean routing trigger for the graph
     - research_loops: Counter of completed re-research passes (0, 1, 2)
     - final_report: Complete compiled markdown report
+    - citation_metrics: Quantitative validation of inline citations
     - status_log: UI activity stream (appended via operator.add)
     """
 
@@ -66,6 +80,7 @@ class ResearchState(TypedDict):
     # Researcher output
     research_data: Annotated[List[dict], operator.add]
     sources: Annotated[List[str], operator.add]
+    source_registry: Annotated[List[dict], operator.add]
 
     # Summarizer output (one latest summary per question_id)
     summaries: List[dict]
@@ -80,6 +95,8 @@ class ResearchState(TypedDict):
 
     # Writer output
     final_report: str
+    citation_metrics: Optional[dict]
 
     # System activity log
-    status_log: Annotated[List[str], operator.add]
+    status_log: Annotated[List[str], operator.add]
+

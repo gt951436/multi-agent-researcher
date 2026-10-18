@@ -1,6 +1,7 @@
 # app.py
 import streamlit as st
 from datetime import datetime
+from config.settings import SETTINGS
 from graph.workflow import build_graph
 from graph.state import ResearchState
 
@@ -164,6 +165,7 @@ if run_button and query.strip() and not st.session_state.is_running:
         "sub_questions":       [],
         "research_data":       [],
         "sources":             [],
+        "source_registry":     [],
         "summaries":           [],
         "critique":            "",
         "critic_review":       None,
@@ -172,9 +174,9 @@ if run_button and query.strip() and not st.session_state.is_running:
         "needs_more_research": False,
         "research_loops":      0,
         "final_report":        "",
+        "citation_metrics":    None,
         "status_log":          []
     }
-
 
     accumulated_state = {k: v for k, v in initial_state.items()}
 
@@ -188,11 +190,12 @@ if run_button and query.strip() and not st.session_state.is_running:
 
             # Merge update into accumulated state
             for key, val in node_update.items():
-                if key in ["research_data", "sources", "status_log"] \
+                if key in ["research_data", "sources", "source_registry", "status_log"] \
                         and isinstance(val, list):
                     accumulated_state[key] = accumulated_state.get(key, []) + val
                 else:
                     accumulated_state[key] = val
+
 
             completed_agents.append(node_name)
 
@@ -242,7 +245,7 @@ if run_button and query.strip() and not st.session_state.is_running:
             if "critic" in completed_agents:
                 badge = "🔴 Needs more research" if verdict else "🟢 Approved"
                 lines.append(f"\n**Critic verdict:** {badge}  \n"
-                             f"**Loops:** {loops}/{2}")
+                             f"**Loops:** {loops}/{SETTINGS.MAX_RESEARCH_LOOPS}")
 
             elapsed = (datetime.now() - start_time).seconds
             lines.append(f"\n⏱️ _Elapsed: {elapsed}s_")
@@ -283,6 +286,10 @@ if run_button and query.strip() and not st.session_state.is_running:
     loops         = accumulated_state.get("research_loops", 0)
     report_len    = len(accumulated_state.get("final_report", ""))
 
+    reg = accumulated_state.get("source_registry", [])
+    full_text_count = sum(1 for s in reg if isinstance(s, dict) and s.get("content_type") == "full_text")
+    cit_metrics = accumulated_state.get("citation_metrics")
+
     raw_conf = accumulated_state.get("confidence")
     if not raw_conf:
         if "| Confidence | 🟢 High" in accumulated_state.get("final_report", ""):
@@ -301,9 +308,14 @@ if run_button and query.strip() and not st.session_state.is_running:
     st.markdown("---")
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Time",        f"{elapsed_total}s")
-    m2.metric("Sources",     source_count)
-    m3.metric("Loops",       loops)
-    m4.metric("Report",      f"{report_len} chars")
+    sources_label = f"{source_count}" if full_text_count == 0 else f"{source_count} ({full_text_count} full)"
+    m2.metric("Sources",     sources_label)
+    m3.metric("Loops",       f"{loops}/{SETTINGS.MAX_RESEARCH_LOOPS}")
+    if cit_metrics and cit_metrics.get("total_citations", 0) > 0:
+        prec = cit_metrics.get("precision", 1.0) * 100
+        m4.metric("Citations", f"{cit_metrics['valid_citations']} ({prec:.0f}% verified)")
+    else:
+        m4.metric("Report",  f"{report_len} chars")
     m5.metric("Confidence",  confidence_display)
 
 

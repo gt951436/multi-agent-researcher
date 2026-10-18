@@ -109,3 +109,33 @@ def test_summarizer_incremental_update_avoids_duplicates(mock_get_llm):
 
     # LLM was invoked only ONCE for Q2, NOT for Q1
     assert mock_llm.invoke.call_count == 1
+
+
+@patch("agents.summarizer.get_llm")
+def test_summarizer_gap_flagging_when_no_evidence(mock_get_llm):
+    """Verify that when no valid search results exist for a question, it is flagged as a research gap."""
+    mock_llm = MagicMock()
+    mock_get_llm.return_value = mock_llm
+
+    state = {
+        "sub_questions": [{"id": "Q1", "question": "Unknown classified technology?"}],
+        "research_data": [
+            {
+                "question_id": "Q1",
+                "key_facts": "No search results were found for this question.",
+                "result_count": 0,
+                "iteration": 0
+            }
+        ],
+        "summaries": [],
+        "research_loops": 0
+    }
+
+    result = summarizer_agent(state)
+    summaries = result["summaries"]
+
+    assert len(summaries) == 1
+    assert summaries[0]["has_gap"] is True
+    assert "RESEARCH GAP" in summaries[0]["summary"]
+    # LLM shouldn't be invoked when there are no valid facts
+    assert mock_llm.invoke.call_count == 0

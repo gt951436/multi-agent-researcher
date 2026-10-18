@@ -133,6 +133,7 @@ def run_research(query: str) -> dict:
         "sub_questions":       [],
         "research_data":       [],
         "sources":             [],
+        "source_registry":     [],
         "summaries":           [],
         "critique":            "",
         "critic_review":       None,
@@ -141,10 +142,12 @@ def run_research(query: str) -> dict:
         "needs_more_research": False,
         "research_loops":      0,
         "final_report":        "",
+        "citation_metrics":    None,
         "status_log":          []
     }
+
 
     # invoke() runs the full graph synchronously and returns
     # the final state after all nodes have completed.
     final_state = graph.invoke(initial_state)
-    return final_state
+    return final_state
